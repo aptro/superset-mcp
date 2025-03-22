@@ -1,8 +1,19 @@
 # Superset MCP Integration
+[![smithery badge](https://smithery.ai/badge/@aptro/superset-mcp)](https://smithery.ai/server/@aptro/superset-mcp)
 
 MCP server for interacting with Apache Superset, enabling AI agents to connect to and control a Superset instance programmatically.
 
 ## Setup Instructions
+
+### Installing via Smithery
+
+To install Superset Integration for Claude Desktop automatically via [Smithery](https://smithery.ai/server/@aptro/superset-mcp):
+
+```bash
+npx -y @smithery/cli install @aptro/superset-mcp --client claude
+```
+
+### Manual Installation
 
 1. **Set Up Superset Locally**
 

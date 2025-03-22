@@ -1,0 +1,34 @@
+# Smithery configuration file: https://smithery.ai/docs/config#smitheryyaml
+
+startCommand:
+  type: stdio
+  configSchema:
+    # JSON Schema defining the configuration options for the MCP.
+    type: object
+    properties:
+      supersetBaseUrl:
+        type: string
+        default: http://localhost:8088
+        description: The URL of your Superset instance.
+      supersetUsername:
+        type: string
+        description: Username for Superset authentication.
+      supersetPassword:
+        type: string
+        description: Password for Superset authentication.
+  commandFunction:
+    # A JS function that produces the CLI command based on the given config to start the MCP on stdio.
+    |-
+    (config) => ({
+      command: 'python',
+      args: ['main.py'],
+      env: {
+        SUPERSET_BASE_URL: config.supersetBaseUrl,
+        SUPERSET_USERNAME: config.supersetUsername || '',
+        SUPERSET_PASSWORD: config.supersetPassword || ''
+      }
+    })
+  exampleConfig:
+    supersetBaseUrl: http://localhost:8088
+    supersetUsername: admin
+    supersetPassword: admin
