@@ -11,3 +11,4 @@ wheels/
 
 .env
 .superset_token
+.superset_memories/
