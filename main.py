@@ -12,7 +12,7 @@ from typing import (
 import os
 import httpx
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 import inspect
 from threading import Thread
@@ -23,6 +23,7 @@ from fastapi.responses import HTMLResponse
 from mcp.server.fastmcp import FastMCP, Context
 from dotenv import load_dotenv
 import json
+import time
 
 """
 Superset MCP Integration
@@ -65,6 +66,10 @@ class SupersetContext:
     access_token: Optional[str] = None
     csrf_token: Optional[str] = None
     app: FastAPI = None
+    onboarding_completed: bool = False
+    instance_name: Optional[str] = None
+    instance_metadata: Dict[str, Any] = field(default_factory=dict)
+    memories: Dict[str, Any] = field(default_factory=dict)
 
 
 def load_stored_token() -> Optional[str]:
@@ -87,6 +92,172 @@ def save_access_token(token: str):
         print(f"Warning: Could not save access token: {e}")
 
 
+def get_instance_name_from_url(url: str) -> str:
+    """Extract a safe instance name from the URL for memory organization"""
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    # Use netloc (host and port) for unique instance identification
+    instance_name = parsed.netloc.replace(":", "_")
+    # Fallback if empty
+    if not instance_name:
+        instance_name = "default_instance"
+    return instance_name
+
+
+def get_memory_dir(instance_name: str) -> str:
+    """Get the directory path for instance-specific memories"""
+    memory_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".superset_memories", instance_name)
+    # Ensure the directory exists
+    os.makedirs(memory_dir, exist_ok=True)
+    return memory_dir
+
+
+def get_memory_path(instance_name: str, memory_name: str) -> str:
+    """Get full path for a memory file"""
+    memory_dir = get_memory_dir(instance_name)
+    # Ensure the memory name is safe for filesystem
+    safe_name = memory_name.replace("/", "_").replace("\\", "_")
+    return os.path.join(memory_dir, f"{safe_name}.json")
+
+
+def load_memory(instance_name: str, memory_name: str) -> Optional[Dict[str, Any]]:
+    """Load a memory by name for specific instance"""
+    try:
+        file_path = get_memory_path(instance_name, memory_name)
+        if os.path.exists(file_path):
+            with open(file_path, "r", encoding="utf-8") as f:
+                return json.loads(f.read())
+        return None
+    except Exception as e:
+        print(f"Error loading memory {memory_name}: {e}")
+        return None
+
+
+def save_memory(instance_name: str, memory_name: str, data: Dict[str, Any]) -> bool:
+    """Save a memory by name for specific instance"""
+    try:
+        file_path = get_memory_path(instance_name, memory_name)
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        # Update the memory index
+        update_memory_index(instance_name, memory_name, data)
+        return True
+    except Exception as e:
+        print(f"Error saving memory {memory_name}: {e}")
+        return False
+
+
+def list_memories(instance_name: str) -> List[str]:
+    """List all available memories for specific instance"""
+    try:
+        memory_dir = get_memory_dir(instance_name)
+        files = os.listdir(memory_dir)
+        # Filter for json files and remove extension
+        return [os.path.splitext(f)[0] for f in files if f.endswith('.json') and f != 'memory_index.json']
+    except Exception as e:
+        print(f"Error listing memories: {e}")
+        return []
+
+
+def update_memory_index(instance_name: str, memory_name: str, memory_data: Dict[str, Any]) -> bool:
+    """Update the memory index with metadata about this memory"""
+    try:
+        memory_dir = get_memory_dir(instance_name)
+        index_path = os.path.join(memory_dir, "memory_index.json")
+        
+        # Get or create index
+        if os.path.exists(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                index = json.loads(f.read())
+        else:
+            index = {
+                "last_updated": int(time.time()),
+                "categories": {
+                    "datasets": [],
+                    "dashboards": [],
+                    "databases": [],
+                    "queries": [],
+                    "analysis_techniques": [],
+                    "best_practices": [],
+                    "templates": [],
+                    "user_preferences": [],
+                    "meta": [],
+                    "other": []
+                },
+                "memories": {}
+            }
+        
+        # Extract metadata from memory
+        metadata = memory_data.get("metadata", {})
+        category = metadata.get("category", "other")
+        description = metadata.get("description", "")
+        tags = metadata.get("tags", [])
+        related_memories = metadata.get("related_memories", [])
+        last_updated = metadata.get("last_updated", int(time.time()))
+        
+        # Update categories list if needed
+        if category in index["categories"]:
+            if memory_name not in index["categories"][category]:
+                index["categories"][category].append(memory_name)
+        else:
+            # If category doesn't exist, add to "other"
+            if memory_name not in index["categories"]["other"]:
+                index["categories"]["other"].append(memory_name)
+        
+        # Update memory metadata in index
+        index["memories"][memory_name] = {
+            "category": category,
+            "description": description,
+            "last_updated": last_updated,
+            "related_memories": related_memories,
+            "tags": tags
+        }
+        
+        # Update last_updated timestamp
+        index["last_updated"] = int(time.time())
+        
+        # Save updated index
+        with open(index_path, "w", encoding="utf-8") as f:
+            json.dump(index, f, indent=2, ensure_ascii=False)
+        
+        return True
+    except Exception as e:
+        print(f"Error updating memory index: {e}")
+        return False
+
+
+def search_memories(instance_name: str, query: str) -> List[Dict[str, Any]]:
+    """Simple search for memories based on metadata"""
+    try:
+        memory_dir = get_memory_dir(instance_name)
+        index_path = os.path.join(memory_dir, "memory_index.json")
+        
+        if not os.path.exists(index_path):
+            return []
+        
+        with open(index_path, "r", encoding="utf-8") as f:
+            index = json.loads(f.read())
+        
+        results = []
+        query = query.lower()
+        
+        for memory_name, metadata in index["memories"].items():
+            # Search in name, description, and tags
+            if (query in memory_name.lower() or 
+                query in metadata.get("description", "").lower() or 
+                any(query in tag.lower() for tag in metadata.get("tags", []))):
+                
+                results.append({
+                    "name": memory_name,
+                    "metadata": metadata
+                })
+        
+        return results
+    except Exception as e:
+        print(f"Error searching memories: {e}")
+        return []
+
+
 @asynccontextmanager
 async def superset_lifespan(server: FastMCP) -> AsyncIterator[SupersetContext]:
     """Manage application lifecycle for Superset integration"""
@@ -95,8 +266,17 @@ async def superset_lifespan(server: FastMCP) -> AsyncIterator[SupersetContext]:
     # Create HTTP client
     client = httpx.AsyncClient(base_url=SUPERSET_BASE_URL, timeout=30.0)
 
+    # Extract instance name from URL
+    instance_name = get_instance_name_from_url(SUPERSET_BASE_URL)
+    print(f"Using instance name: {instance_name}")
+
     # Create context
-    ctx = SupersetContext(client=client, base_url=SUPERSET_BASE_URL, app=app)
+    ctx = SupersetContext(
+        client=client, 
+        base_url=SUPERSET_BASE_URL, 
+        app=app,
+        instance_name=instance_name
+    )
 
     # Try to load existing token
     stored_token = load_stored_token()
@@ -119,6 +299,16 @@ async def superset_lifespan(server: FastMCP) -> AsyncIterator[SupersetContext]:
             print(f"Error verifying stored token: {e}")
             ctx.access_token = None
             client.headers.pop("Authorization", None)
+    
+    # Load instance metadata if available
+    try:
+        instance_metadata = load_memory(instance_name, "instance_metadata")
+        if instance_metadata:
+            ctx.instance_metadata = instance_metadata.get("content", {})
+            ctx.onboarding_completed = instance_metadata.get("content", {}).get("onboarding_completed", False)
+            print(f"Loaded instance metadata for {instance_name}")
+    except Exception as e:
+        print(f"Warning: Failed to load instance metadata: {e}")
 
     try:
         yield ctx
@@ -1151,6 +1341,61 @@ async def superset_dataset_create(
     return await make_api_request(ctx, "post", "/api/v1/dataset/", data=payload)
 
 
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_dataset_update(
+    ctx: Context, dataset_id: int, data: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Update an existing dataset in Superset
+
+    Makes a request to the /api/v1/dataset/{id} PUT endpoint to update properties
+    of an existing dataset such as column configurations, metrics, and display settings.
+
+    Args:
+        dataset_id: ID of the dataset to update
+        data: Data to update, can include:
+              - table_name: Physical table name
+              - columns: Column configurations
+              - metrics: Metric definitions
+              - owners: List of owner IDs
+              - description: Dataset description
+              - cache_timeout: Cache timeout in seconds
+              - is_managed_externally: Whether managed externally
+              - external_url: External URL for managed datasets
+              - extra: JSON string with extra configuration
+
+    Returns:
+        A dictionary with the updated dataset information
+    """
+    return await make_api_request(ctx, "put", f"/api/v1/dataset/{dataset_id}", data=data)
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_dataset_delete(ctx: Context, dataset_id: int) -> Dict[str, Any]:
+    """
+    Delete a dataset from Superset
+
+    Makes a request to the /api/v1/dataset/{id} DELETE endpoint to remove a dataset.
+    This operation is permanent and cannot be undone.
+
+    Args:
+        dataset_id: ID of the dataset to delete
+
+    Returns:
+        A dictionary with deletion confirmation message
+    """
+    response = await make_api_request(ctx, "delete", f"/api/v1/dataset/{dataset_id}")
+
+    if not response.get("error"):
+        return {"message": f"Dataset {dataset_id} deleted successfully"}
+
+    return response
+
+
 # ===== SQL Lab Tools =====
 
 
@@ -1817,15 +2062,734 @@ async def superset_advanced_data_type_convert(
 @handle_api_errors
 async def superset_advanced_data_type_list(ctx: Context) -> Dict[str, Any]:
     """
-    Get list of available advanced data types
-
-    Makes a request to the /api/v1/advanced_data_type/types endpoint to retrieve
-    all advanced data types supported by this Superset instance.
+    List all advanced data types supported by this Superset instance.
 
     Returns:
         A dictionary with available advanced data types and their configurations
     """
     return await make_api_request(ctx, "get", "/api/v1/advanced_data_type/types")
+
+
+# ===== Memory Management Tools =====
+
+@mcp.tool()
+@handle_api_errors
+async def superset_memory_write(ctx: Context, memory_name: str, content: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Write a memory to the memory store for the current Superset instance
+    
+    Stores a memory for the current instance that can be retrieved later. The memory will
+    be associated with this specific Superset instance based on its URL.
+    
+    Args:
+        memory_name: Name of the memory to save (use naming conventions for organization)
+        content: Dictionary containing the memory data
+    
+    Returns:
+        Dict with success confirmation
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    instance_name = superset_ctx.instance_name
+    
+    # Add timestamp if not present
+    if not content.get("metadata", {}).get("created"):
+        if not "metadata" in content:
+            content["metadata"] = {}
+        content["metadata"]["created"] = int(time.time())
+    
+    # Always update the last_updated timestamp
+    if not "metadata" in content:
+        content["metadata"] = {}
+    content["metadata"]["last_updated"] = int(time.time())
+    
+    # Save the memory
+    success = save_memory(instance_name, memory_name, content)
+    
+    if success:
+        return {"success": True, "message": f"Memory '{memory_name}' saved successfully"}
+    else:
+        return {"error": f"Failed to save memory '{memory_name}'"}
+
+
+@mcp.tool()
+@handle_api_errors
+async def superset_memory_write_standardized(
+    ctx: Context, 
+    memory_name: str, 
+    category: str,
+    description: str,
+    content: Dict[str, Any], 
+    tags: List[str] = None,
+    related_memories: List[str] = None
+) -> Dict[str, Any]:
+    """
+    Write a standardized memory to the memory store
+    
+    Creates a well-structured memory entry with proper metadata.
+    This simplifies memory creation with a consistent structure.
+    
+    Args:
+        memory_name: Name of the memory (use consistent naming conventions)
+        category: Category for the memory (datasets, dashboards, databases, etc.)
+        description: Clear description of the memory's content and purpose
+        content: The actual memory content
+        tags: List of tags for better searchability
+        related_memories: List of related memory names for cross-referencing
+    
+    Returns:
+        Dict with success confirmation
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    
+    # Create properly structured memory
+    memory_data = {
+        "metadata": {
+            "name": memory_name,
+            "description": description,
+            "category": category,
+            "tags": tags or [],
+            "related_memories": related_memories or [],
+            "created": int(time.time()),
+            "last_updated": int(time.time())
+        },
+        "content": content
+    }
+    
+    # Call the base memory write function
+    return await superset_memory_write(ctx, memory_name, memory_data)
+
+
+@mcp.tool()
+@handle_api_errors
+async def superset_memory_read(ctx: Context, memory_name: str) -> Dict[str, Any]:
+    """
+    Read a memory from the memory store
+    
+    Retrieves a specific memory by name from the instance-specific memory store.
+    
+    Args:
+        memory_name: Name of the memory to retrieve
+    
+    Returns:
+        Dict containing the memory data or error
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    instance_name = superset_ctx.instance_name
+    
+    memory = load_memory(instance_name, memory_name)
+    
+    if memory:
+        return {"success": True, "memory": memory}
+    else:
+        return {"error": f"Memory '{memory_name}' not found"}
+
+
+@mcp.tool()
+@handle_api_errors
+async def superset_memory_list(ctx: Context) -> Dict[str, Any]:
+    """
+    List all available memories for the current Superset instance
+    
+    Returns a list of all memories stored for this specific Superset instance.
+    
+    Returns:
+        Dict containing the list of memory names
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    instance_name = superset_ctx.instance_name
+    
+    memories = list_memories(instance_name)
+    
+    return {"success": True, "memories": memories}
+
+
+@mcp.tool()
+@handle_api_errors
+async def superset_memory_search(ctx: Context, query: str) -> Dict[str, Any]:
+    """
+    Search memories by query
+    
+    Searches through memory metadata (names, descriptions, tags) for matches.
+    
+    Args:
+        query: Search term to look for in memory metadata
+    
+    Returns:
+        Dict containing search results
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    instance_name = superset_ctx.instance_name
+    
+    results = search_memories(instance_name, query)
+    
+    return {
+        "success": True, 
+        "query": query, 
+        "results_count": len(results),
+        "results": results
+    }
+
+
+@mcp.tool()
+@handle_api_errors
+async def superset_memory_delete(ctx: Context, memory_name: str) -> Dict[str, Any]:
+    """
+    Delete a memory from the store
+    
+    Removes a specific memory by name.
+    
+    Args:
+        memory_name: Name of the memory to delete
+    
+    Returns:
+        Dict with success confirmation
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    instance_name = superset_ctx.instance_name
+    
+    try:
+        memory_path = get_memory_path(instance_name, memory_name)
+        if os.path.exists(memory_path):
+            os.remove(memory_path)
+            
+            # Also update the index by removing this memory
+            memory_dir = get_memory_dir(instance_name)
+            index_path = os.path.join(memory_dir, "memory_index.json")
+            
+            if os.path.exists(index_path):
+                with open(index_path, "r", encoding="utf-8") as f:
+                    index = json.loads(f.read())
+                
+                # Remove from categories
+                for category, memories in index["categories"].items():
+                    if memory_name in memories:
+                        index["categories"][category].remove(memory_name)
+                
+                # Remove from memories
+                if memory_name in index["memories"]:
+                    del index["memories"][memory_name]
+                
+                # Update timestamp
+                index["last_updated"] = int(time.time())
+                
+                # Save updated index
+                with open(index_path, "w", encoding="utf-8") as f:
+                    json.dump(index, f, indent=2, ensure_ascii=False)
+            
+            return {"success": True, "message": f"Memory '{memory_name}' deleted successfully"}
+        else:
+            return {"error": f"Memory '{memory_name}' not found"}
+    except Exception as e:
+        return {"error": f"Error deleting memory '{memory_name}': {str(e)}"}
+
+
+@mcp.tool()
+@handle_api_errors
+async def superset_memory_auto_retrieve(ctx: Context, query: str) -> Dict[str, Any]:
+    """
+    Auto-retrieve relevant memories based on a query
+    
+    Searches through all memories to find the most relevant ones for the given query.
+    This is useful for answering user questions based on previously stored knowledge.
+    
+    Args:
+        query: The user query or topic to find relevant memories for
+    
+    Returns:
+        Dict containing the most relevant memories
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    instance_name = superset_ctx.instance_name
+    
+    # Search for relevant memories
+    results = search_memories(instance_name, query)
+    
+    if not results:
+        return {
+            "success": True,
+            "found_relevant_memories": False,
+            "message": "No relevant memories found. Consider creating new memories after addressing this query."
+        }
+    
+    # Load full content for the top 3 most relevant memories
+    top_memories = results[:3]
+    full_memories = []
+    
+    for memory_info in top_memories:
+        memory_name = memory_info["name"]
+        memory_data = load_memory(instance_name, memory_name)
+        if memory_data:
+            full_memories.append(memory_data)
+    
+    return {
+        "success": True,
+        "found_relevant_memories": True,
+        "query": query,
+        "results_count": len(results),
+        "top_memories": full_memories
+    }
+
+
+@mcp.tool()
+@handle_api_errors
+async def superset_instance_onboard(ctx: Context) -> Dict[str, Any]:
+    """
+    Onboard a new Superset instance
+    
+    Captures basic information about a Superset instance and stores it in memory.
+    This should be run once for each new Superset instance.
+    
+    Returns:
+        Dict with success confirmation
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    instance_name = superset_ctx.instance_name
+    
+    # Check if authentication is required
+    if not superset_ctx.access_token:
+        return {"error": "Authentication required. Please authenticate first."}
+    
+    try:
+        # Get instance information
+        user_info = await make_api_request(ctx, "get", "/api/v1/me/")
+        databases = await make_api_request(ctx, "get", "/api/v1/database/")
+        dashboards = await make_api_request(ctx, "get", "/api/v1/dashboard/")
+        datasets = await make_api_request(ctx, "get", "/api/v1/dataset/")
+        
+        # Extract base info
+        instance_info = {
+            "base_url": superset_ctx.base_url,
+            "user": user_info.get("result", {}).get("username", "unknown"),
+            "database_count": len(databases.get("result", [])),
+            "dashboard_count": len(dashboards.get("result", [])),
+            "dataset_count": len(datasets.get("result", [])),
+            "onboarding_completed": True,
+            "onboarded_at": int(time.time())
+        }
+        
+        # Save to context
+        superset_ctx.instance_metadata = instance_info
+        superset_ctx.onboarding_completed = True
+        
+        # Create memory structure
+        memory_data = {
+            "metadata": {
+                "name": "instance_metadata",
+                "description": "Basic information about the Superset instance",
+                "category": "meta",
+                "tags": ["instance", "metadata", "configuration"],
+                "related_memories": [],
+                "created": int(time.time()),
+                "last_updated": int(time.time())
+            },
+            "content": instance_info
+        }
+        
+        # Save memory
+        success = save_memory(instance_name, "instance_metadata", memory_data)
+        
+        if success:
+            # Also create a memory index guide for this instance
+            await superset_memory_write_standardized(
+                ctx,
+                "meta_memory_index",
+                "meta",
+                "Guide to the memory system with best practices and organization",
+                {
+                    "memory_system_overview": {
+                        "description": "The memory system allows storing and retrieving structured information for Superset analysis",
+                        "use_cases": [
+                            "Storing dataset analysis results for future reference",
+                            "Creating reusable dashboard design patterns",
+                            "Documenting SQL patterns and optimization techniques",
+                            "Saving user preferences and commonly used configurations",
+                            "Building a knowledge base of best practices for data visualization"
+                        ],
+                        "benefits": [
+                            "Standardized approach to data analysis",
+                            "Reusable templates for common tasks",
+                            "Persistent storage across conversations",
+                            "Searchable and categorized knowledge base"
+                        ]
+                    },
+                    "memory_categories": {
+                        "datasets": "Information about specific datasets including column types, metrics, and analysis approaches",
+                        "dashboards": "Dashboard designs, layouts, and best practices",
+                        "databases": "Database connection details and configuration",
+                        "queries": "Useful SQL queries and patterns",
+                        "analysis_techniques": "Analytical approaches and methodologies",
+                        "best_practices": "General best practices for Superset use",
+                        "templates": "Reusable templates for creating other memories",
+                        "user_preferences": "User-specific settings and preferences",
+                        "meta": "Information about the memory system itself",
+                        "other": "Miscellaneous memories that don't fit into other categories"
+                    },
+                    "naming_conventions": {
+                        "prefix_importance": "Always use appropriate prefixes to categorize memories",
+                        "prefixes": {
+                            "dataset_": "For dataset-specific information",
+                            "dashboard_": "For dashboard designs and layouts",
+                            "analysis_": "For analytical approaches",
+                            "best_practice_": "For best practices",
+                            "template_": "For reusable templates",
+                            "database_": "For database information",
+                            "query_": "For SQL queries and patterns",
+                            "meta_": "For memory system information",
+                            "user_": "For user preferences"
+                        }
+                    },
+                    "memory_structure_guidelines": {
+                        "metadata": {
+                            "description": "Always include a clear description",
+                            "category": "Assign appropriate category for organization",
+                            "tags": "Add relevant tags for improved search",
+                            "related_memories": "Link to related memories to create a network of information"
+                        }
+                    }
+                },
+                ["meta", "index", "guide", "best_practices"]
+            )
+            
+            return {
+                "success": True, 
+                "message": "Superset instance onboarded successfully",
+                "instance_info": instance_info
+            }
+        else:
+            return {"error": "Failed to save instance metadata"}
+    except Exception as e:
+        return {"error": f"Error during instance onboarding: {str(e)}"}
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_database_onboard(ctx: Context, database_id: int) -> Dict[str, Any]:
+    """
+    Onboard a specific database from the Superset instance
+    
+    Collects and stores detailed information about a database, including
+    its schemas, tables, and structure.
+    
+    Args:
+        database_id: ID of the database to onboard
+    
+    Returns:
+        Dict with success confirmation
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    instance_name = superset_ctx.instance_name
+    
+    try:
+        # Get database details
+        database_info = await make_api_request(ctx, "get", f"/api/v1/database/{database_id}")
+        if database_info.get("error"):
+            return {"error": f"Failed to get database info: {database_info.get('error')}"}
+        
+        database = database_info.get("result", {})
+        
+        # Get schemas
+        schemas_info = await make_api_request(ctx, "get", f"/api/v1/database/{database_id}/schemas/")
+        schemas = schemas_info.get("result", [])
+        
+        # Get tables (first schema only for efficiency)
+        tables = []
+        if schemas:
+            tables_info = await make_api_request(
+                ctx, "get", f"/api/v1/database/{database_id}/tables/", 
+                params={"schema": schemas[0]}
+            )
+            tables = tables_info.get("result", [])
+        
+        # Create memory structure
+        memory_data = {
+            "metadata": {
+                "name": f"database_{database.get('database_name', str(database_id))}",
+                "description": f"Details about the {database.get('database_name')} database",
+                "category": "databases",
+                "tags": [
+                    "database", 
+                    database.get("backend", "unknown"),
+                    database.get("database_name", "").lower()
+                ],
+                "related_memories": ["instance_metadata"],
+                "created": int(time.time()),
+                "last_updated": int(time.time())
+            },
+            "content": {
+                "database_id": database_id,
+                "name": database.get("database_name"),
+                "backend": database.get("backend"),
+                "sqlalchemy_uri_placeholder": database.get("sqlalchemy_uri_placeholder"),
+                "allows_subquery": database.get("allows_subquery", False),
+                "allows_cost_estimate": database.get("allows_cost_estimate", False),
+                "schemas": schemas,
+                "sample_tables": [t.get("table_name") for t in tables[:10]],
+                "schema_count": len(schemas),
+                "table_count_in_sample_schema": len(tables)
+            }
+        }
+        
+        # Save memory
+        success = save_memory(instance_name, f"database_{database.get('database_name', str(database_id))}", memory_data)
+        
+        if success:
+            return {
+                "success": True, 
+                "message": f"Database {database.get('database_name')} onboarded successfully",
+                "database_info": {
+                    "id": database_id,
+                    "name": database.get("database_name"),
+                    "schema_count": len(schemas),
+                    "table_count_in_sample_schema": len(tables)
+                }
+            }
+        else:
+            return {"error": f"Failed to save database information"}
+    except Exception as e:
+        return {"error": f"Error during database onboarding: {str(e)}"}
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_dataset_onboard(ctx: Context, dataset_id: int) -> Dict[str, Any]:
+    """
+    Onboard a specific dataset from the Superset instance
+    
+    Collects and stores detailed information about a dataset, including
+    its columns, metrics, and structure.
+    
+    Args:
+        dataset_id: ID of the dataset to onboard
+    
+    Returns:
+        Dict with success confirmation
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    instance_name = superset_ctx.instance_name
+    
+    try:
+        # Get dataset details
+        dataset_info = await make_api_request(ctx, "get", f"/api/v1/dataset/{dataset_id}")
+        if dataset_info.get("error"):
+            return {"error": f"Failed to get dataset info: {dataset_info.get('error')}"}
+        
+        dataset = dataset_info.get("result", {})
+        
+        # Create memory structure
+        memory_data = {
+            "metadata": {
+                "name": f"dataset_{dataset.get('table_name', str(dataset_id))}",
+                "description": f"Details about the {dataset.get('table_name')} dataset",
+                "category": "datasets",
+                "tags": [
+                    "dataset", 
+                    dataset.get("database", {}).get("backend", "unknown"),
+                    dataset.get("table_name", "").lower()
+                ],
+                "related_memories": ["instance_metadata"],
+                "created": int(time.time()),
+                "last_updated": int(time.time())
+            },
+            "content": {
+                "dataset_id": dataset_id,
+                "name": dataset.get("table_name"),
+                "description": dataset.get("description"),
+                "schema": dataset.get("schema"),
+                "database_id": dataset.get("database", {}).get("id"),
+                "database_name": dataset.get("database", {}).get("database_name"),
+                "sql": dataset.get("sql"),
+                "main_dttm_col": dataset.get("main_dttm_col"),
+                "columns": dataset.get("columns", []),
+                "metrics": dataset.get("metrics", []),
+                "column_count": len(dataset.get("columns", [])),
+                "recommended_visualizations": get_recommended_visualizations(dataset)
+            }
+        }
+        
+        # Save memory
+        success = save_memory(instance_name, f"dataset_{dataset.get('table_name', str(dataset_id))}", memory_data)
+        
+        if success:
+            return {
+                "success": True, 
+                "message": f"Dataset {dataset.get('table_name')} onboarded successfully",
+                "dataset_info": {
+                    "id": dataset_id,
+                    "name": dataset.get("table_name"),
+                    "column_count": len(dataset.get("columns", [])),
+                    "metric_count": len(dataset.get("metrics", []))
+                }
+            }
+        else:
+            return {"error": f"Failed to save dataset information"}
+    except Exception as e:
+        return {"error": f"Error during dataset onboarding: {str(e)}"}
+
+
+def get_recommended_visualizations(dataset: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Helper function to recommend visualizations based on dataset structure"""
+    recommendations = []
+    
+    # Check for time column
+    has_time = bool(dataset.get("main_dttm_col"))
+    
+    # Check for numeric columns
+    numeric_columns = [
+        col.get("column_name") 
+        for col in dataset.get("columns", []) 
+        if col.get("type") in ["BIGINT", "FLOAT", "INTEGER", "DECIMAL", "DOUBLE"]
+    ]
+    
+    # Check for categorical columns
+    categorical_columns = [
+        col.get("column_name") 
+        for col in dataset.get("columns", []) 
+        if col.get("type") in ["VARCHAR", "STRING", "TEXT", "CHAR"]
+    ]
+    
+    # Time series recommendation
+    if has_time and numeric_columns:
+        recommendations.append({
+            "viz_type": "line",
+            "name": "Time Series Analysis",
+            "columns": {
+                "x": dataset.get("main_dttm_col"),
+                "y": numeric_columns[:2]  # First two numeric columns
+            }
+        })
+    
+    # Bar chart for categories
+    if categorical_columns and numeric_columns:
+        recommendations.append({
+            "viz_type": "bar",
+            "name": "Category Comparison",
+            "columns": {
+                "dimension": categorical_columns[0],
+                "metric": numeric_columns[0]
+            }
+        })
+    
+    # Pie chart if we have categories
+    if categorical_columns and numeric_columns:
+        recommendations.append({
+            "viz_type": "pie",
+            "name": "Distribution Analysis",
+            "columns": {
+                "dimension": categorical_columns[0],
+                "metric": numeric_columns[0]
+            }
+        })
+    
+    # Table for general exploration
+    recommendations.append({
+        "viz_type": "table",
+        "name": "Data Exploration",
+        "columns": {
+            "columns": (categorical_columns + numeric_columns)[:5]  # First 5 columns
+        }
+    })
+    
+    return recommendations
+
+
+@mcp.tool()
+@handle_api_errors
+async def superset_memory_prepare_chat_context(ctx: Context) -> Dict[str, Any]:
+    """
+    Prepare the chat context by loading essential memories
+    
+    Collects essential information about the Superset instance and 
+    recently accessed databases/datasets to prepare for a conversation.
+    This reduces the need for repeated API calls during conversation.
+    
+    Returns:
+        Dict with the prepared context
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    instance_name = superset_ctx.instance_name
+    
+    # Check if onboarding is completed
+    if not superset_ctx.onboarding_completed:
+        return {
+            "success": False,
+            "message": "Instance has not been onboarded yet. Please run superset_instance_onboard first."
+        }
+    
+    # Load essential memories
+    key_memories = ["instance_metadata", "meta_memory_index"]
+    
+    # Add database and dataset memories if available
+    all_memories = list_memories(instance_name)
+    database_memories = [m for m in all_memories if m.startswith("database_")]
+    dataset_memories = [m for m in all_memories if m.startswith("dataset_")]
+    
+    # Load the memories
+    loaded_memories = {}
+    
+    for memory_name in key_memories + database_memories[:2] + dataset_memories[:3]:
+        memory_data = load_memory(instance_name, memory_name)
+        if memory_data:
+            loaded_memories[memory_name] = memory_data
+    
+    # Set in context for immediate access
+    superset_ctx.memories = loaded_memories
+    
+    return {
+        "success": True,
+        "message": "Chat context prepared successfully",
+        "loaded_memories": list(loaded_memories.keys()),
+        "instance_stats": {
+            "total_memories": len(all_memories),
+            "database_memories": len(database_memories),
+            "dataset_memories": len(dataset_memories)
+        }
+    }
+
+
+@mcp.tool()
+@handle_api_errors
+async def superset_check_instance_onboarding_status(ctx: Context) -> Dict[str, Any]:
+    """
+    Check if the current Superset instance has been onboarded
+    
+    Verifies if the current Superset instance has completed onboarding
+    and returns its status information.
+    
+    Returns:
+        Dict with onboarding status and instance information
+    """
+    superset_ctx: SupersetContext = ctx.request_context.lifespan_context
+    instance_name = superset_ctx.instance_name
+    
+    # Check if instance metadata exists
+    instance_metadata = load_memory(instance_name, "instance_metadata")
+    
+    if not instance_metadata:
+        return {
+            "onboarded": False,
+            "message": "This Superset instance has not been onboarded yet. Run superset_instance_onboard to initialize.",
+            "instance_name": instance_name,
+            "base_url": superset_ctx.base_url
+        }
+    
+    # Get statistics on memories
+    memories = list_memories(instance_name)
+    database_memories = [m for m in memories if m.startswith("database_")]
+    dataset_memories = [m for m in memories if m.startswith("dataset_")]
+    
+    return {
+        "onboarded": True,
+        "instance_name": instance_name,
+        "base_url": superset_ctx.base_url,
+        "onboarding_data": instance_metadata.get("content", {}),
+        "memory_stats": {
+            "total_memories": len(memories),
+            "database_memories": len(database_memories),
+            "dataset_memories": len(dataset_memories)
+        }
+    }
 
 
 if __name__ == "__main__":
