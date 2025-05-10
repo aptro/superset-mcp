@@ -1828,6 +1828,54 @@ async def superset_advanced_data_type_list(ctx: Context) -> Dict[str, Any]:
     return await make_api_request(ctx, "get", "/api/v1/advanced_data_type/types")
 
 
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_dataset_create_from_sql(
+    ctx: Context,
+    table_name: str,
+    database_id: int,
+    sql: str,
+    schema: str = None,
+    normalize_columns: bool = False,
+    always_filter_main_dttm: bool = False,
+    owners: List[int] = None,
+) -> Dict[str, Any]:
+    """
+    Create a new virtual dataset in Superset based on SQL query
+
+    Makes a request to the /api/v1/dataset/ POST endpoint to create a new virtual dataset
+    from a SQL query rather than an existing table.
+
+    Args:
+        table_name: Display name for the virtual dataset
+        database_id: ID of the database to query
+        sql: SQL query that defines the dataset
+        schema: Optional database schema (for table name qualification)
+        normalize_columns: Whether to normalize columns (default: False)
+        always_filter_main_dttm: Whether to always filter on the main datetime column (default: False)
+        owners: Optional list of user IDs who should own this dataset
+
+    Returns:
+        A dictionary with the created dataset information including its ID
+    """
+    payload = {
+        "table_name": table_name,
+        "database": database_id,
+        "sql": sql,
+        "normalize_columns": normalize_columns,
+        "always_filter_main_dttm": always_filter_main_dttm,
+    }
+
+    if schema:
+        payload["schema"] = schema
+
+    if owners:
+        payload["owners"] = owners
+
+    return await make_api_request(ctx, "post", "/api/v1/dataset/", data=payload)
+
+
 if __name__ == "__main__":
     print("Starting Superset MCP server...")
     mcp.run()
