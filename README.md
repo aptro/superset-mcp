@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/aptro-superset-mcp-badge.png)](https://mseep.ai/app/aptro-superset-mcp)
+
 # Superset MCP Integration
 [![smithery badge](https://smithery.ai/badge/@aptro/superset-mcp)](https://smithery.ai/server/@aptro/superset-mcp)
 
