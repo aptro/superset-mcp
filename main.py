@@ -1162,6 +1162,61 @@ async def superset_dataset_create(
     return await make_api_request(ctx, "post", "/api/v1/dataset/", data=payload)
 
 
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_dataset_update(
+    ctx: Context, dataset_id: int, data: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Update an existing dataset in Superset
+
+    Makes a request to the /api/v1/dataset/{id} PUT endpoint to update properties
+    of an existing dataset such as column configurations, metrics, and display settings.
+
+    Args:
+        dataset_id: ID of the dataset to update
+        data: Data to update, can include:
+              - table_name: Physical table name
+              - columns: Column configurations
+              - metrics: Metric definitions
+              - owners: List of owner IDs
+              - description: Dataset description
+              - cache_timeout: Cache timeout in seconds
+              - is_managed_externally: Whether managed externally
+              - external_url: External URL for managed datasets
+              - extra: JSON string with extra configuration
+
+    Returns:
+        A dictionary with the updated dataset information
+    """
+    return await make_api_request(ctx, "put", f"/api/v1/dataset/{dataset_id}", data=data)
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_dataset_delete(ctx: Context, dataset_id: int) -> Dict[str, Any]:
+    """
+    Delete a dataset from Superset
+
+    Makes a request to the /api/v1/dataset/{id} DELETE endpoint to remove a dataset.
+    This operation is permanent and cannot be undone.
+
+    Args:
+        dataset_id: ID of the dataset to delete
+
+    Returns:
+        A dictionary with deletion confirmation message
+    """
+    response = await make_api_request(ctx, "delete", f"/api/v1/dataset/{dataset_id}")
+
+    if not response.get("error"):
+        return {"message": f"Dataset {dataset_id} deleted successfully"}
+
+    return response
+
+
 # ===== SQL Lab Tools =====
 
 
@@ -1837,6 +1892,421 @@ async def superset_advanced_data_type_list(ctx: Context) -> Dict[str, Any]:
         A dictionary with available advanced data types and their configurations
     """
     return await make_api_request(ctx, "get", "/api/v1/advanced_data_type/types")
+
+
+# ===== Domain-Specific High-Level Tools =====
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_analytics_dashboard(
+    ctx: Context,
+    dashboard_title: str,
+    dataset_id: int,
+    metrics: List[str],
+    dimensions: List[str] = None,
+    time_column: str = None,
+    time_range: str = "Last 30 days",
+    chart_types: List[str] = None,
+) -> Dict[str, Any]:
+    """
+    Create a complete analytics dashboard with multiple related charts
+
+    This high-level tool abstracts multiple operations:
+    1. Creates a new dashboard
+    2. Creates multiple charts based on the specified metrics and dimensions
+    3. Adds all charts to the dashboard with an organized layout
+    4. Configures dashboard filters for interactive analysis
+    
+    The tool automatically generates complementary visualizations that work well together
+    to provide a comprehensive view of the data.
+
+    Args:
+        dashboard_title: Title for the new dashboard
+        dataset_id: ID of the dataset to use for all charts
+        metrics: List of metrics to visualize (e.g. ["count", "sum__revenue"])
+        dimensions: Optional list of dimensions to group by (e.g. ["country", "product"])
+        time_column: Optional time column for time-series analysis
+        time_range: Time range to filter data (defaults to "Last 30 days")
+        chart_types: Optional list of specific chart types to create (if not provided, will choose appropriate ones)
+
+    Returns:
+        A dictionary with the created dashboard information including its ID and URLs to access it
+    """
+    # Get dataset info to determine appropriate visualizations
+    dataset_info = await superset_dataset_get_by_id(ctx, dataset_id)
+    if "error" in dataset_info:
+        return dataset_info
+
+    # Default chart types if not specified
+    if not chart_types:
+        if time_column:
+            chart_types = ["line", "bar", "big_number_total", "pie"]
+        else:
+            chart_types = ["bar", "pie", "table", "big_number_total"]
+
+    # Create dashboard first
+    dashboard_result = await superset_dashboard_create(ctx, dashboard_title)
+    if "error" in dashboard_result:
+        return dashboard_result
+    
+    dashboard_id = dashboard_result.get("id")
+
+    # Initialize dashboard metadata with filter configuration
+    filter_config = []
+    if dimensions:
+        for dimension in dimensions:
+            filter_config.append({
+                "id": f"filter_{dimension}",
+                "name": dimension.capitalize(),
+                "filterType": "filter_select",
+                "targets": [{"datasetId": dataset_id, "column": {"name": dimension}}]
+            })
+    
+    if time_column:
+        filter_config.append({
+            "id": "filter_time",
+            "name": "Time Range",
+            "filterType": "filter_time_range",
+            "targets": [{"datasetId": dataset_id, "column": {"name": time_column}}]
+        })
+
+    # Initialize with layout that will be populated as we create charts
+    json_metadata = {
+        "filter_configuration": filter_config,
+        "timed_refresh_immune_slices": [],
+        "expanded_slices": {},
+        "refresh_frequency": 0,
+        "color_scheme": "supersetColors",
+        "label_colors": {},
+        "shared_label_colors": {},
+        "color_scheme_domain": []
+    }
+
+    # Update dashboard with filter configuration
+    await superset_dashboard_update(ctx, dashboard_id, {
+        "json_metadata": json.dumps(json_metadata)
+    })
+
+    # Charts to create and their positions on the dashboard
+    chart_positions = []
+    created_charts = []
+    
+    # Get dataset type for chart creation
+    datasource_type = "table"  # Default for datasets in Superset
+    
+    # Create each chart based on chart_types
+    for i, chart_type in enumerate(chart_types):
+        if i >= len(metrics):
+            # Skip if we've run out of metrics to visualize
+            continue
+            
+        metric = metrics[i]
+        chart_title = f"{metric.replace('__', ' ')} by {dimensions[0] if dimensions else 'All'}"
+        
+        # Configure chart parameters based on type
+        params = {
+            "datasource": f"{dataset_id}__{datasource_type}",
+            "viz_type": chart_type,
+            "time_range": time_range,
+            "metrics": [metric],
+            "adhoc_filters": [],
+            "row_limit": 100,
+        }
+        
+        # Add dimension-specific configuration
+        if dimensions:
+            if chart_type in ["pie", "bar", "table"]:
+                params["groupby"] = [dimensions[0]]
+            elif chart_type == "line" and time_column:
+                params["groupby"] = [dimensions[0]] if len(dimensions) > 0 else []
+                params["x_axis"] = time_column
+                
+        # For time series, add time column
+        if time_column and chart_type == "line":
+            params["x_axis"] = time_column
+            params["time_grain_sqla"] = "P1D"  # Daily grain
+        
+        # Create the chart
+        try:
+            chart_result = await superset_chart_create(
+                ctx,
+                slice_name=chart_title,
+                datasource_id=dataset_id,
+                datasource_type=datasource_type,
+                viz_type=chart_type,
+                params=params
+            )
+            
+            if "error" in chart_result:
+                return {"error": f"Failed to create chart {chart_title}: {chart_result['error']}"}
+                
+            chart_id = chart_result.get("id")
+            created_charts.append({"id": chart_id, "title": chart_title, "type": chart_type})
+            
+            # Calculate position for this chart on the dashboard
+            row = i // 2  # Two charts per row
+            col = i % 2   # Alternating left and right
+            
+            # Add to chart positions for dashboard layout
+            chart_positions.append({
+                "type": "CHART",
+                "id": chart_id,
+                "children": [],
+                "meta": {
+                    "width": 6,  # Half-width for 2 charts per row
+                    "height": 50,
+                    "chartId": chart_id
+                }
+            })
+            
+        except Exception as e:
+            return {"error": f"Error creating chart {chart_title}: {str(e)}"}
+    
+    # Organize charts into rows for the dashboard
+    rows = []
+    for i in range(0, len(chart_positions), 2):
+        row_charts = chart_positions[i:i+2]
+        rows.append({
+            "type": "ROW",
+            "id": f"row_{i//2}",
+            "children": row_charts,
+            "meta": {
+                "background": "TRANSPARENT"
+            }
+        })
+    
+    # Create the full dashboard layout
+    dashboard_layout = {
+        "type": "ROOT",
+        "id": "ROOT_ID",
+        "children": rows
+    }
+    
+    # Update the dashboard with the layout
+    json_metadata["dashboard_title"] = dashboard_title
+    json_metadata["layout"] = dashboard_layout
+    
+    update_result = await superset_dashboard_update(ctx, dashboard_id, {
+        "json_metadata": json.dumps(json_metadata)
+    })
+    
+    if "error" in update_result:
+        return {"error": f"Failed to update dashboard layout: {update_result['error']}"}
+    
+    # Return success with dashboard and chart information
+    return {
+        "success": True,
+        "message": f"Created analytics dashboard '{dashboard_title}' with {len(created_charts)} charts",
+        "dashboard_id": dashboard_id,
+        "dashboard_url": f"{SUPERSET_BASE_URL}/superset/dashboard/{dashboard_id}/",
+        "charts": created_charts
+    }
+
+
+# ===== Domain-Specific High-Level Tools =====
+
+
+@mcp.tool()
+@requires_auth
+@handle_api_errors
+async def superset_kpi_summary(
+    ctx: Context,
+    dashboard_title: str,
+    dataset_id: int,
+    kpis: List[Dict[str, str]],
+    comparison_period: str = "previous",
+    time_column: str = None,
+    time_range: str = "Last 30 days",
+) -> Dict[str, Any]:
+    """
+    Create a KPI summary dashboard showing key performance indicators with comparisons
+    
+    This high-level tool creates a dashboard focused on KPI monitoring:
+    1. Creates a new dashboard
+    2. For each KPI, creates a big number visualization showing the current value
+    3. Adds comparison to previous period (growth/decline indicators)
+    4. Adds trend charts for each KPI
+    5. Organizes everything in a clean, executive-friendly layout
+    
+    Args:
+        dashboard_title: Title for the new KPI dashboard
+        dataset_id: ID of the dataset to use for KPI calculations
+        kpis: List of KPI definitions, each with:
+             - name: Display name of the KPI
+             - metric: Metric expression (e.g., "sum__revenue", "count_distinct__users")
+             - format: Optional display format (e.g., "$,.2f", ".1%")
+        comparison_period: How to calculate comparison ("previous", "year_ago")
+        time_column: Time column for trend calculation 
+        time_range: Time range to analyze (e.g., "Last 30 days", "Last quarter")
+    
+    Returns:
+        Dashboard information with KPI summary
+    """
+    # Create dashboard first
+    dashboard_result = await superset_dashboard_create(ctx, dashboard_title)
+    if "error" in dashboard_result:
+        return dashboard_result
+    
+    dashboard_id = dashboard_result.get("id")
+    
+    # Dashboard metadata setup
+    json_metadata = {
+        "filter_configuration": [],
+        "timed_refresh_immune_slices": [],
+        "expanded_slices": {},
+        "refresh_frequency": 0,
+        "color_scheme": "supersetColors",
+        "label_colors": {},
+    }
+    
+    # Add time filter if time column is provided
+    if time_column:
+        json_metadata["filter_configuration"].append({
+            "id": "filter_time",
+            "name": "Time Period",
+            "filterType": "filter_time_range",
+            "targets": [{"datasetId": dataset_id, "column": {"name": time_column}}]
+        })
+    
+    # Arrays to track created elements
+    created_charts = []
+    chart_positions = []
+    
+    # Default datasource type for datasets
+    datasource_type = "table"
+    
+    # Create visualizations for each KPI
+    for i, kpi in enumerate(kpis):
+        kpi_name = kpi.get("name", f"KPI {i+1}")
+        kpi_metric = kpi.get("metric", "count(*)")
+        kpi_format = kpi.get("format", ",.1f")
+        
+        # 1. Create Big Number visualization with comparison
+        big_number_params = {
+            "datasource": f"{dataset_id}__{datasource_type}",
+            "viz_type": "big_number_total",
+            "time_range": time_range,
+            "metric": kpi_metric,
+            "adhoc_filters": [],
+            "y_axis_format": kpi_format,
+            "comparison_type": comparison_period,
+            "show_trend_line": True,
+            "start_y_axis_at_zero": True,
+            "time_grain_sqla": "P1D" if time_column else None,
+            "header_font_size": 0.4,
+            "subheader_font_size": 0.15,
+        }
+        
+        # Add time column reference if available
+        if time_column:
+            big_number_params["x_axis"] = time_column
+        
+        big_number_result = await superset_chart_create(
+            ctx,
+            slice_name=f"{kpi_name} Summary",
+            datasource_id=dataset_id,
+            datasource_type=datasource_type,
+            viz_type="big_number_total",
+            params=big_number_params
+        )
+        
+        if "error" in big_number_result:
+            return {"error": f"Failed to create KPI summary: {big_number_result['error']}"}
+            
+        big_number_id = big_number_result.get("id")
+        created_charts.append({"id": big_number_id, "title": f"{kpi_name} Summary", "type": "big_number_total"})
+        
+        # 2. Create trend chart if time column is available
+        trend_chart_id = None
+        if time_column:
+            trend_params = {
+                "datasource": f"{dataset_id}__{datasource_type}",
+                "viz_type": "line",
+                "time_range": time_range,
+                "metrics": [kpi_metric],
+                "adhoc_filters": [],
+                "x_axis": time_column,
+                "time_grain_sqla": "P1D",  # Daily grain
+                "y_axis_format": kpi_format,
+                "show_legend": False,
+                "rich_tooltip": True,
+            }
+            
+            trend_result = await superset_chart_create(
+                ctx,
+                slice_name=f"{kpi_name} Trend",
+                datasource_id=dataset_id,
+                datasource_type=datasource_type,
+                viz_type="line",
+                params=trend_params
+            )
+            
+            if "error" not in trend_result:
+                trend_chart_id = trend_result.get("id")
+                created_charts.append({"id": trend_chart_id, "title": f"{kpi_name} Trend", "type": "line"})
+        
+        # Position in dashboard layout - create a row for each KPI with big number and trend
+        kpi_row_children = [{
+            "type": "CHART",
+            "id": big_number_id,
+            "children": [],
+            "meta": {
+                "width": 6 if trend_chart_id else 12,  # Full width if no trend chart
+                "height": 35,
+                "chartId": big_number_id
+            }
+        }]
+        
+        # Add trend chart to row if created
+        if trend_chart_id:
+            kpi_row_children.append({
+                "type": "CHART",
+                "id": trend_chart_id,
+                "children": [],
+                "meta": {
+                    "width": 6,
+                    "height": 35,
+                    "chartId": trend_chart_id
+                }
+            })
+        
+        chart_positions.append({
+            "type": "ROW",
+            "id": f"row_{i}",
+            "children": kpi_row_children,
+            "meta": {
+                "background": "TRANSPARENT"
+            }
+        })
+    
+    # Create dashboard layout with all KPI rows
+    dashboard_layout = {
+        "type": "ROOT",
+        "id": "ROOT_ID",
+        "children": chart_positions
+    }
+    
+    # Update dashboard with layout and metadata
+    json_metadata["dashboard_title"] = dashboard_title
+    json_metadata["layout"] = dashboard_layout
+    
+    update_result = await superset_dashboard_update(ctx, dashboard_id, {
+        "json_metadata": json.dumps(json_metadata)
+    })
+    
+    if "error" in update_result:
+        return {"error": f"Failed to update KPI dashboard layout: {update_result['error']}"}
+    
+    # Return success with dashboard information
+    return {
+        "success": True,
+        "message": f"Created KPI summary dashboard '{dashboard_title}' with {len(kpis)} KPIs",
+        "dashboard_id": dashboard_id,
+        "dashboard_url": f"{SUPERSET_BASE_URL}/superset/dashboard/{dashboard_id}/",
+        "kpis": [kpi.get("name") for kpi in kpis]
+    }
 
 
 if __name__ == "__main__":
